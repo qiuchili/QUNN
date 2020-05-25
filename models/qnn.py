@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from layers.embedding import PhaseEmbedding
+from layers.embedding import PositionEmbedding
 from layers.multiply import ComplexMultiply
 from layers.rnn import QRNNCell
 from layers.measurement import QMeasurement
@@ -21,18 +21,24 @@ class QNN(nn.Module):
         self.embed_dim = opt.embed_dim
         self.n_classes = opt.output_dim
         self.amp_projection = nn.Linear(self.input_dim, self.embed_dim) 
-        self.phase_projection = nn.Linear(self.input_dim, self.embed_dim)
-
+        self.phase_embed = PositionEmbedding(self.embed_dim, device = self.device)
         self.multiply = ComplexMultiply()
         self.outer = QOuter()
+        self.output_cell_dim = opt.output_cell_dim
         self.out_dropout_rate = opt.out_dropout_rate
         self.num_layers = opt.num_layers
         self.recurrent_cells = nn.ModuleList([QRNNCell(self.embed_dim)]*self.num_layers)
-        self.out_dropout = QDropout(p=self.out_dropout_rate)
+        #self.out_dropout = QDropout(p=self.out_dropout_rate)
         self.activation = QActivation(scale_factor = 2, beta = 0.8)
         
-        self.dense = QDense(self.embed_dim, self.n_classes)
-        self.measurement = QMeasurement(self.n_classes)
+        #self.dense = QDense(self.embed_dim, self.n_classes)
+        self.measurement = QMeasurement(self.embed_dim)
+
+        self.fc_out = nn.Sequential(nn.Linear(self.embed_dim, self.output_cell_dim),
+                                        nn.ReLU(),
+                                        nn.Dropout(self.out_dropout_rate),
+                                        nn.Linear(self.output_cell_dim, self.n_classes))
+
 
         
     def get_params(self):
@@ -43,17 +49,16 @@ class QNN(nn.Module):
             unitary_params.append(self.recurrent_cells[i].unitary_x)
             unitary_params.append(self.recurrent_cells[i].unitary_h)
             
-        #unitary_params.append(self.dense.weight)
-        unitary_params.append(self.dense.weight)
 
         unitary_params.extend(list(self.measurement.parameters()))
      
         remaining_params = list(self.amp_projection.parameters())
-        remaining_params.extend(list(self.phase_projection.parameters()))
+        remaining_params.extend(list(self.phase_embed.parameters()))
+        
         for i in range(self.num_layers):
             remaining_params.append(self.recurrent_cells[i].Lambda)
             
-       	remaining_params.append(self.dense.Lambda)
+       	remaining_params.extend(list(self.fc_out.parameters()))
             
         return unitary_params, remaining_params
     
@@ -69,7 +74,7 @@ class QNN(nn.Module):
         
         # Phase Projection 
         # May be replaced by phase embedding in real tasks
-        phase_rep = self.phase_projection(x)
+        phase_rep = self.phase_embed(torch.zeros_like(x[:,:,0],dtype=torch.int64))
         pure_states = self.multiply([amp_rep, phase_rep])
         pure_matrices = self.outer(pure_states)
         
@@ -82,20 +87,18 @@ class QNN(nn.Module):
             all_h = []
             for t in range(time_stamps):
                 h = self.recurrent_cells[l](in_states[t],h)
-                h = self.activation(h)
-                all_h.append(h)
+                all_h.append(self.activation(h))
             in_states = all_h
 
         output = []
         
         for _h in in_states:
-            _h = self.out_dropout(_h)
-            _h = self.dense(_h)
             measurement_probs = self.measurement(_h)
-            output.append(measurement_probs)
+            _output = self.fc_out(measurement_probs)
+            output.append(_output)
             
             
         output = torch.stack(output, dim=-2)
-        log_prob = torch.log(output) # batch, seq_len,  n_classes
+        log_prob = F.log_softmax(output, dim=2) # batch, seq_len,  n_classes
 
         return log_prob
