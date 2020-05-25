@@ -11,6 +11,7 @@ import os
 import numpy as np
 import models
 from models.qnn import QNN
+from models.qattn import QAttN
 import argparse
 import pandas as pd
 import pickle
@@ -34,7 +35,7 @@ def set_seed(params):
         torch.manual_seed(params.seed)
     
 def run(params):   
-    model = QNN(params)
+    model = QAttN(params)
     num_samples = 1000
     time_stamps = 100
     inputs = torch.rand(num_samples, time_stamps, params.input_dim)

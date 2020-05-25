@@ -8,129 +8,82 @@ from layers.embedding import PositionEmbedding
 from layers.multiply import ComplexMultiply
 from layers.mixture import QMixture
 from layers.measurement import QMeasurement
-from layers.measurement import ComplexMeasurement
-from layers.quantumnn.outer import QOuter
-from models.multimodal.monologue.SimpleNet import SimpleNet
+from layers.outer import QOuter
 from layers.attention import QAttention
-from layers.complexnn.l2_norm import L2Norm
+from layers.l2_norm import L2Norm
 
 class QAttN(nn.Module):
     def __init__(self, opt):
         super(QAttN, self).__init__()
         self.device = opt.device    
-        self.input_dims = opt.input_dims
-        self.total_input_dim = sum(self.input_dims)
+        self.input_dim = opt.input_dim
         self.embed_dim = opt.embed_dim
-        self.speaker_num = opt.speaker_num
         self.n_classes = opt.output_dim
-        self.projections = nn.ModuleList([nn.Linear(dim, self.embed_dim) for dim in self.input_dims])
-        
-        self.grus = nn.ModuleList([nn.GRU(dim, self.embed_dim, 1) for dim in self.input_dims])
+        self.amp_projection = nn.Linear(self.input_dim, self.embed_dim) 
+        self.phase_embed = PositionEmbedding(self.embed_dim, device = self.device)
         self.multiply = ComplexMultiply()
         self.outer = QOuter()
-        self.norm = L2Norm(dim = -1)
-        self.mixture = QMixture(device = self.device)
         self.output_cell_dim = opt.output_cell_dim
-        self.phase_embeddings = nn.ModuleList([PositionEmbedding(self.embed_dim, device = self.device) for dim in self.input_dims]) 
         self.out_dropout_rate = opt.out_dropout_rate
+
         self.attention = QAttention()
-        self.num_modalities = len(self.input_dims)
-        #self.out_dropout = QDropout(p=self.out_dropout_rate)
+
         
         #self.dense = QDense(self.embed_dim, self.n_classes)
-        self.measurement_type = opt.measurement_type
-        if opt.measurement_type == 'quantum':
-            self.measurement = QMeasurement(self.embed_dim)
-            self.fc_out = SimpleNet(self.embed_dim* self.num_modalities, self.output_cell_dim,
-                                    self.out_dropout_rate,self.n_classes,
-                                    output_activation = nn.Tanh())
-        
-        else:
-            self.measurement = ComplexMeasurement(self.embed_dim * self.num_modalities, units = 20)
-            self.fc_out = SimpleNet(20, self.output_cell_dim,
-                                    self.out_dropout_rate,self.n_classes,
-                                    output_activation = nn.Tanh())
+        self.measurement = QMeasurement(self.embed_dim)
+
+        self.fc_out = nn.Sequential(nn.Linear(self.embed_dim, self.output_cell_dim),
+                                        nn.ReLU(),
+                                        nn.Dropout(self.out_dropout_rate),
+                                        nn.Linear(self.output_cell_dim, self.n_classes))
                 
     def get_params(self):
         unitary_params = []
         remaining_params = []
         
-        remaining_params.extend(list(self.projections.parameters()))
-        remaining_params.extend(list(self.grus.parameters()))
-        remaining_params.extend(list(self.phase_embeddings.parameters()))
+        remaining_params.extend(list(self.amp_projection.parameters()))
+        remaining_params.extend(list(self.phase_embed.parameters()))
             
-        if self.measurement_type == 'quantum':
-            unitary_params.extend(list(self.measurement.parameters()))
-        else:
-            remaining_params.extend(list(self.measurement.parameters()))
+        unitary_params.extend(list(self.measurement.parameters()))
         remaining_params.extend(list(self.fc_out.parameters()))
             
         return unitary_params, remaining_params
     
     
-    def forward(self, in_modalities):
-        smask = in_modalities[-2] # Speaker ids
-        in_modalities = in_modalities[:-2]
+    def forward(self, x):
+        # (batch_size, time_stamps, input_dim)
+        batch_size = x.shape[0]
+        time_stamps = x.shape[1]
         
-        batch_size = in_modalities[0].shape[0]
-        time_stamps = in_modalities[0].shape[1]
         
-        # Project All modalities of each utterance to the same space
-        #utterance_reps = [nn.Tanh()(projection(x)) for x, projection in zip(in_modalities,self.projections)] 
+        # Amplitude Projection
+        # May be replaced by amplitude embedding in real tasks
+        amp_rep = F.normalize(self.amp_projection(x), dim = -1)
         
-        utterance_reps = [nn.Tanh()(projection(x)[0]) for x, projection in zip(in_modalities,self.grus)] 
+        # Phase Projection 
+        # May be replaced by phase embedding in real tasks
+        phase_rep = self.phase_embed(torch.zeros_like(x[:,:,0],dtype=torch.int64))
+        pure_states = self.multiply([amp_rep, phase_rep])
 
-        # Take the amplitudes 
-        # multiply with modality specific vectors to construct weights
-        weights = [self.norm(rep) for rep in utterance_reps]
-        
-        #weights = F.softmax(torch.cat(weights, dim = -1), dim = -1)
-        
-        #self.phase_embedding(smask.argmax(dim= -1))
+        pure_matrices = self.outer(pure_states)
 
-        amplitudes = [F.normalize(rep, dim = -1) for rep in utterance_reps]
-        phases = [phase_embed(w) for w,phase_embed in zip(amplitudes, self.phase_embeddings)]
+        #print(len(pure_states))
+        #print(pure_states[0].shape)
+        #key_states = [torch.stack(s, dim=1) for s in zip(*pure_states)]
+       
 
-        unimodal_pure = [self.multiply([phase, amplitude]) for phase, amplitude in zip(phases,amplitudes)]
+        in_states = self.attention(pure_matrices, pure_states, torch.ones(batch_size, time_stamps,1))
+
+        output = []
         
-        unimodal_matrices = [self.outer(s) for s in unimodal_pure]
-        
-        
-        probs = []
-        
-        # For each modality
-        # we mix the remaining modalities as queries (to_be_measured systems) 
-        # and treat the modality features as keys (measurement operators)
-        
-        for ind in range(self.num_modalities):   
+        for _h in in_states:
+            measurement_probs = self.measurement(_h)
+            _output = self.fc_out(measurement_probs)
+            output.append(_output)
             
-            # Obtain mixed states for the rest modalities
-            other_weights = [weights[i] for i in range(self.num_modalities) if not i == ind]
-            mixture_weights = F.softmax(torch.cat(other_weights, dim = -1), dim = -1)
-            other_states = [unimodal_matrices[i] for i in range(self.num_modalities) if not i == ind]     
-            q_states = self.mixture([other_states, mixture_weights])
             
-            # Obtain pure states and weights for the modality of interest
-            k_weights = weights[ind]
-            k_states = unimodal_pure[ind]
-            
-            # Compute cross-modal interactions, output being a list of post-measurement states
-            in_states = self.attention(q_states, k_states, k_weights)
-            
-            # Apply measurement to each output state
-            output = []
-            for _h in in_states:
-                measurement_probs = self.measurement(_h)
-                output.append(measurement_probs)
-
-            probs.append(output)
-        
-        # Concatenate the measurement probabilities per-time-stamp
-        concat_probs = [self.fc_out(torch.cat(output_t, dim = -1)) for output_t in zip(*probs)] 
-        concat_probs = torch.stack(concat_probs, dim=-2)
-        
-        log_prob = F.log_softmax(concat_probs, 2) # batch, seq_len,  n_classes
-
+        output = torch.stack(output, dim=-2)
+        log_prob = F.log_softmax(output, dim=2) # batch, seq_len,  n_classes
 
         return log_prob
 
