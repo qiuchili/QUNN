@@ -15,12 +15,12 @@ def step_unitary(G_r, G_i, W_r, W_i, lr):
 
     
     # cayley_numer = I-lr/2 * A
-    cayley_numer_r = idm - (lr/2)* A_skew_r
-    cayley_numer_i = - (lr/2)* A_skew_i
+    cayley_numer_r = idm + (lr/2)* A_skew_r
+    cayley_numer_i = + (lr/2)* A_skew_i
     
     # cayley_demon = (I + lr/2 * A)^(-1)
-    X = idm + (lr/2)* A_skew_r
-    Y = (lr/2)* A_skew_i
+    X = idm - (lr/2)* A_skew_r
+    Y = - (lr/2)* A_skew_i
     
     #(X + i*Y)^-1 = (X + Y*X^-1*Y)^-1 - i*(Y + X*Y^-1*X)^-1
     
